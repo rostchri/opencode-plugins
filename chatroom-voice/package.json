@@ -1,0 +1,27 @@
+{
+  "name": "opencode-chatroom-voice",
+  "version": "0.0.1",
+  "description": "OpenCode plugin: event-driven voice integration via a Phoenix-channel voice backend (browser TTS/STT, multi-room, multimedia replies).",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/rostchri/opencode-plugins.git",
+    "directory": "chatroom-voice"
+  },
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": ["dist", "README.md"],
+  "scripts": {
+    "build": "bun build src/index.ts --outdir dist --target bun --format esm",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": "*"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "latest",
+    "@opencode-ai/sdk": "latest",
+    "typescript": "^5.6.0"
+  }
+}

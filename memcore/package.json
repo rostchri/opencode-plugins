@@ -1,0 +1,27 @@
+{
+  "name": "opencode-memcore",
+  "version": "0.0.1",
+  "description": "OpenCode plugin: long-term agent memory through a self-hosted memcore MCP server (AMP tool family). Analogue to opencode-supermemory pointed at a self-hosted backend.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/rostchri/opencode-plugins.git",
+    "directory": "memcore"
+  },
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": ["dist", "README.md"],
+  "scripts": {
+    "build": "bun build src/index.ts --outdir dist --target bun --format esm",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": "*"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "latest",
+    "@opencode-ai/sdk": "latest",
+    "typescript": "^5.6.0"
+  }
+}
