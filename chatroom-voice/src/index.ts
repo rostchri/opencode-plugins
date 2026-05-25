@@ -27,10 +27,17 @@
  *   OPENCODE_VOICE_ROOM        Default room_id (default: "Lobby")
  *   OPENCODE_VOICE_SESSION_ID  Optional stable session identifier override
  *   OPENCODE_VOICE_AGENT_NAME  sender field value (default: "opencode")
+ *
+ * Security note: Bearer token is passed as a Phoenix Socket param (query
+ * string in the WebSocket upgrade request). This is the standard Phoenix
+ * authentication pattern and is visible in reverse-proxy logs. A short-lived
+ * token mechanism would mitigate this but requires backend changes (tracked
+ * separately in issue #2329).
  */
 
 import type { Plugin, Hooks } from '@opencode-ai/plugin';
 import { tool } from '@opencode-ai/plugin';
+import type { Socket, Channel } from 'phoenix';
 import type {
   EventMessagePartUpdated,
   EventMessageUpdated,
@@ -38,8 +45,32 @@ import type {
 } from '@opencode-ai/sdk';
 
 // ---------------------------------------------------------------------------
+// Validation
+// ---------------------------------------------------------------------------
+
+/** Allowed room_id format: alphanumeric, hyphen, underscore, 1-64 chars. */
+const ROOM_ID_PATTERN = /^[a-zA-Z0-9_-]{1,64}$/;
+
+/**
+ * Validate a room_id. Returns an error message string if invalid, or undefined
+ * if valid.
+ */
+function validateRoomId(room: string): string | undefined {
+  if (!ROOM_ID_PATTERN.test(room)) {
+    return `Invalid room_id "${room}". Must match /^[a-zA-Z0-9_-]{1,64}$/.`;
+  }
+  return undefined;
+}
+
+/** Max inbound text size in bytes (mirrors server.mjs 50 KB limit). */
+const MAX_INBOUND_BYTES = 50_000;
+
+// ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
+
+/** Emitted once per process to avoid log-spam in tests. */
+let bearerWarnEmitted = false;
 
 interface Config {
   wsUrl: string;
@@ -63,6 +94,19 @@ function loadConfig(): Config {
   if (!bearer) throw new Error('opencode-chatroom-voice: OPENCODE_VOICE_BEARER is required');
   if (!httpUrl) throw new Error('opencode-chatroom-voice: OPENCODE_VOICE_HTTP_URL is required');
 
+  // Security notice: the bearer token is sent as a Phoenix Socket param which
+  // becomes a query parameter in the WebSocket upgrade URL. This is the
+  // standard Phoenix auth pattern but makes the token visible in proxy logs.
+  // See issue #2329 for short-lived token mitigation (requires backend change).
+  if (!bearerWarnEmitted) {
+    bearerWarnEmitted = true;
+    process.stderr.write(
+      '[chatroom-voice] WARN: Bearer token is passed as a Phoenix Socket param ' +
+      '(query string in WS upgrade). Token may appear in reverse-proxy access logs. ' +
+      'See issue #2329 for short-lived token mitigation.\n',
+    );
+  }
+
   return {
     wsUrl,
     bearer,
@@ -77,16 +121,22 @@ function loadConfig(): Config {
 // HTTP helpers
 // ---------------------------------------------------------------------------
 
+/** Timeout for all outbound HTTP calls in milliseconds. */
+const POST_TIMEOUT_MS = 5_000;
+
 /**
- * POST JSON payload to a chatroom-controller API route.
- * Errors are logged to stderr and swallowed — a single failed HTTP call must
- * not crash the plugin or the opencode session.
+ * POST JSON payload to a chatroom-controller API route with a 5-second timeout.
+ * Errors (network, 4xx, 5xx, timeout) are logged to stderr and swallowed — a
+ * single failed HTTP call must not crash the plugin or the opencode session.
  */
 async function postJson(
   bearer: string,
   url: string,
   body: Record<string, unknown>,
 ): Promise<void> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), POST_TIMEOUT_MS);
+
   try {
     const res = await fetch(url, {
       method: 'POST',
@@ -95,6 +145,7 @@ async function postJson(
         'Content-Type': 'application/json',
       },
       body: JSON.stringify(body),
+      signal: controller.signal,
     });
     if (!res.ok) {
       const text = await res.text().catch(() => '');
@@ -103,8 +154,110 @@ async function postJson(
       );
     }
   } catch (err) {
-    process.stderr.write(`[chatroom-voice] POST ${url} failed: ${String(err)}\n`);
+    if (err instanceof Error && err.name === 'AbortError') {
+      process.stderr.write(`[chatroom-voice] POST ${url} timed out after ${POST_TIMEOUT_MS}ms\n`);
+    } else {
+      process.stderr.write(`[chatroom-voice] POST ${url} failed: ${String(err)}\n`);
+    }
+  } finally {
+    clearTimeout(timer);
   }
+}
+
+/**
+ * Fire-and-forget variant of postJson for hot-path delta events.
+ * The Promise is intentionally not awaited to avoid blocking the event loop
+ * when the backend is slow or unavailable. Errors are still logged via postJson.
+ */
+function postJsonFireAndForget(
+  bearer: string,
+  url: string,
+  body: Record<string, unknown>,
+): void {
+  postJson(bearer, url, body).catch((err: unknown) => {
+    // postJson already swallows errors internally; this is a safety net.
+    process.stderr.write(`[chatroom-voice] Unexpected postJson throw: ${String(err)}\n`);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Part buffer (streaming delta accumulation)
+// ---------------------------------------------------------------------------
+
+/** Max entries in partBuffer before we warn and clear stale ones. */
+const PART_BUFFER_MAX = 1_000;
+
+/** TTL for part buffer entries in milliseconds (5 minutes). */
+const PART_BUFFER_TTL_MS = 5 * 60 * 1_000;
+
+interface PartEntry {
+  kind: 'text' | 'thought';
+  /** Accumulated chunks as array — joined on flush to avoid O(n^2) string concat. */
+  chunks: string[];
+  /** messageId this part belongs to — prevents cross-message bleed on flush. */
+  messageId: string;
+  /** Unix timestamp (ms) of last update — used for TTL eviction. */
+  lastUpdatedAt: number;
+}
+
+/**
+ * Evict stale entries from the part buffer.
+ * Called lazily on each access to avoid setInterval overhead.
+ * Entries older than PART_BUFFER_TTL_MS are removed.
+ */
+function evictStaleParts(partBuffer: Map<string, PartEntry>): void {
+  const cutoff = Date.now() - PART_BUFFER_TTL_MS;
+  for (const [id, entry] of partBuffer) {
+    if (entry.lastUpdatedAt < cutoff) {
+      partBuffer.delete(id);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Context helper
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve room_id and sessionId from tool args + plugin context.
+ * Centralises the repeated resolution pattern across all 5 voice_* tools.
+ */
+function resolveCtx(
+  args: { room_id?: string | undefined },
+  context: { sessionID: string },
+  cfg: Config,
+  activeSessionId: string | undefined,
+): { room: string; sessionId: string } {
+  return {
+    room: args.room_id ?? cfg.defaultRoom,
+    sessionId: activeSessionId ?? context.sessionID,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Tool status helper
+// ---------------------------------------------------------------------------
+
+/**
+ * Post a tool-status event (before/after phase) to the chatroom controller.
+ * Keeps tool.execute.before and .after hooks DRY.
+ */
+function postToolStatus(
+  cfg: Config,
+  input: { callID: string; sessionID: string; tool: string },
+  phase: 'before' | 'after',
+  title?: string,
+): void {
+  const body: Record<string, unknown> = {
+    room_id: cfg.defaultRoom,
+    call_id: input.callID,
+    sender: cfg.agentName,
+    session_id: input.sessionID,
+    phase,
+    tool: input.tool,
+  };
+  if (title !== undefined) body['title'] = title;
+  postJsonFireAndForget(cfg.bearer, `${cfg.httpUrl}/api/tool-status`, body);
 }
 
 // ---------------------------------------------------------------------------
@@ -121,6 +274,9 @@ async function postJson(
  * Message events arriving from the room are injected into the opencode session
  * via `client.session.promptAsync`. If no active session ID is known at event
  * time, the message is silently dropped (the agent is not yet ready).
+ *
+ * Inbound text larger than MAX_INBOUND_BYTES is rejected with a WARN log to
+ * prevent oversized payloads from flooding the session queue.
  */
 async function openPhoenixChannel(
   cfg: Config,
@@ -128,31 +284,14 @@ async function openPhoenixChannel(
   promptAsync: (sessionId: string, text: string) => Promise<void>,
 ): Promise<() => void> {
   // Dynamic import so the module can be tree-shaken / mocked in tests.
-  // The `phoenix` package exports Socket and Channel.
-  const { Socket } = (await import('phoenix')) as {
-    Socket: new (
-      url: string,
-      opts?: Record<string, unknown>,
-    ) => {
-      connect(): void;
-      disconnect(cb?: () => void): void;
-      channel(topic: string, params?: Record<string, unknown>): {
-        on(event: string, cb: (payload: unknown) => void): void;
-        join(): {
-          receive(status: string, cb: (resp: unknown) => void): {
-            receive(status: string, cb: (resp: unknown) => void): void;
-          };
-        };
-        leave(): void;
-      };
-    };
-  };
+  // Use the declared types from phoenix.d.ts — no inline cast needed.
+  const { Socket } = await import('phoenix');
 
   const wsUrl = cfg.wsUrl.endsWith('/websocket')
     ? cfg.wsUrl
     : `${cfg.wsUrl}/websocket`;
 
-  const socket = new Socket(wsUrl, {
+  const socket: Socket = new Socket(wsUrl, {
     params: {
       token: cfg.bearer,
       identity: cfg.sessionId ?? 'opencode',
@@ -161,12 +300,21 @@ async function openPhoenixChannel(
 
   socket.connect();
 
-  const channel = socket.channel(`room:${cfg.defaultRoom}`, {});
+  const channel: Channel = socket.channel(`room:${cfg.defaultRoom}`, {});
 
-  channel.on('message', (payload: unknown) => {
+  // Store listener reference so we can cleanly call channel.off() on teardown.
+  const messageListenerRef: number = channel.on('message', (payload: unknown) => {
     const p = payload as Record<string, unknown>;
     const text = typeof p['text'] === 'string' ? p['text'] : String(p['body'] ?? '');
     if (!text.trim()) return;
+
+    // Size guard: reject oversized inbound payloads (mirrors server.mjs 50 KB limit).
+    if (Buffer.byteLength(text, 'utf8') > MAX_INBOUND_BYTES) {
+      process.stderr.write(
+        `[chatroom-voice] Inbound message rejected — exceeds ${MAX_INBOUND_BYTES} bytes\n`,
+      );
+      return;
+    }
 
     const sid = getSessionId();
     if (!sid) {
@@ -193,6 +341,8 @@ async function openPhoenixChannel(
     });
 
   return () => {
+    // Clean up listener before leaving to prevent listener leaks on reconnect.
+    channel.off('message', messageListenerRef);
     channel.leave();
     socket.disconnect();
   };
@@ -237,11 +387,19 @@ export const ChatroomVoice: Plugin = async (ctx): Promise<Hooks> => {
   }
 
   // Graceful shutdown: close the WebSocket when the process exits.
+  // Safety-net: force-exit after 2s if cleanup hangs.
   const shutdown = () => {
     if (cleanupChannel) {
       cleanupChannel();
       cleanupChannel = undefined;
     }
+    const timer = setTimeout(() => {
+      process.stderr.write('[chatroom-voice] Shutdown timeout — force exit\n');
+      process.exit(0);
+    }, 2_000);
+    // unref() so the timer does not prevent a clean exit if nothing else keeps
+    // the event loop alive.
+    if (typeof timer.unref === 'function') timer.unref();
   };
   process.once('SIGTERM', shutdown);
   process.once('SIGINT', shutdown);
@@ -255,9 +413,10 @@ export const ChatroomVoice: Plugin = async (ctx): Promise<Hooks> => {
    * full_text on the "message.updated" (complete) event without keeping every
    * delta in memory indefinitely.
    *
-   * Map<partId, { kind, accumulated }>
+   * Each entry is keyed by partId and includes the owning messageId to prevent
+   * cross-message bleed when multiple messages stream concurrently.
    */
-  const partBuffer = new Map<string, { kind: 'text' | 'thought'; accumulated: string }>();
+  const partBuffer = new Map<string, PartEntry>();
 
   const hooks: Hooks = {
     // -------------------------------------------------------------------------
@@ -268,9 +427,12 @@ export const ChatroomVoice: Plugin = async (ctx): Promise<Hooks> => {
       // Capture the session ID from session-status events so inbound messages
       // can be routed even if no env-override was provided.
       if (event.type === 'session.status') {
-        const sid = event.properties.sessionID;
-        if (sid && !activeSessionId) {
-          activeSessionId = sid;
+        const status = event.properties;
+        if (typeof status === 'object' && status !== null) {
+          const sid = (status as Record<string, unknown>)['sessionID'];
+          if (typeof sid === 'string' && sid && !activeSessionId) {
+            activeSessionId = sid;
+          }
         }
         return;
       }
@@ -286,21 +448,40 @@ export const ChatroomVoice: Plugin = async (ctx): Promise<Hooks> => {
 
         const kind: 'text' | 'thought' = part.type === 'reasoning' ? 'thought' : 'text';
         const sessionId = part.sessionID;
+        const messageId = part.messageID;
 
         // Track the active session from stream events as well.
         if (sessionId && !activeSessionId) activeSessionId = sessionId;
 
-        // Accumulate for later complete message.
-        const existing = partBuffer.get(part.id);
-        if (existing) {
-          existing.accumulated += delta;
-        } else {
-          partBuffer.set(part.id, { kind, accumulated: delta });
+        // Lazy TTL eviction before any buffer mutation.
+        evictStaleParts(partBuffer);
+
+        // Size-cap guard: warn and clear when buffer grows too large.
+        if (partBuffer.size >= PART_BUFFER_MAX) {
+          process.stderr.write(
+            `[chatroom-voice] WARN: partBuffer size cap (${PART_BUFFER_MAX}) reached — clearing stale entries\n`,
+          );
+          partBuffer.clear();
         }
 
-        await postJson(cfg.bearer, `${cfg.httpUrl}/api/agent-stream-delta`, {
+        // Accumulate in string[] chunks (avoids O(n^2) string concat).
+        const existing = partBuffer.get(part.id);
+        if (existing) {
+          existing.chunks.push(delta);
+          existing.lastUpdatedAt = Date.now();
+        } else {
+          partBuffer.set(part.id, {
+            kind,
+            chunks: [delta],
+            messageId,
+            lastUpdatedAt: Date.now(),
+          });
+        }
+
+        // Fire-and-forget: do NOT await — keeps delta path non-blocking.
+        postJsonFireAndForget(cfg.bearer, `${cfg.httpUrl}/api/agent-stream-delta`, {
           room_id: cfg.defaultRoom,
-          message_id: part.messageID,
+          message_id: messageId,
           sender: cfg.agentName,
           session_id: sessionId,
           kind,
@@ -322,56 +503,44 @@ export const ChatroomVoice: Plugin = async (ctx): Promise<Hooks> => {
         const sessionId = assistant.sessionID;
         if (sessionId && !activeSessionId) activeSessionId = sessionId;
 
-        // Flush all buffered parts for this message.
-        // We emit one agent-stream-complete per tracked part.
-        // Parts that had no delta (e.g. tool-use parts) are silently ignored.
+        // Flush all buffered parts for THIS message only (messageId-gated).
+        // Parts belonging to other messages (e.g. concurrent streams) are kept.
+        const flushPromises: Promise<void>[] = [];
         for (const [partId, buf] of partBuffer) {
-          // The part buffer has no direct message association; we rely on the
-          // fact that all parts for a message are flushed when the message
-          // completes. This is a simplification: if two messages are streamed
-          // concurrently (unusual in practice) parts may be cross-flushed.
-          // For a single-session MVP this is acceptable.
-          await postJson(cfg.bearer, `${cfg.httpUrl}/api/agent-stream-complete`, {
-            room_id: cfg.defaultRoom,
-            message_id: assistant.id,
-            sender: cfg.agentName,
-            session_id: sessionId,
-            kind: buf.kind,
-            full_text: buf.accumulated,
-            trigger_tts: buf.kind === 'text',
-          });
+          if (buf.messageId !== assistant.id) continue;
+
+          flushPromises.push(
+            postJson(cfg.bearer, `${cfg.httpUrl}/api/agent-stream-complete`, {
+              room_id: cfg.defaultRoom,
+              message_id: assistant.id,
+              sender: cfg.agentName,
+              session_id: sessionId,
+              kind: buf.kind,
+              full_text: buf.chunks.join(''),
+              trigger_tts: buf.kind === 'text',
+            }),
+          );
           partBuffer.delete(partId);
         }
+
+        // Flush all matching parts in parallel (independent HTTP calls).
+        await Promise.all(flushPromises);
         return;
       }
     },
 
     // -------------------------------------------------------------------------
     // Tool status hooks (OUTBOUND — "working…" badge)
+    // Fire-and-forget: tool hooks must not block the tool execution pipeline.
     // -------------------------------------------------------------------------
     'tool.execute.before': async (input) => {
       if (!activeSessionId) activeSessionId = input.sessionID;
-      await postJson(cfg.bearer, `${cfg.httpUrl}/api/tool-status`, {
-        room_id: cfg.defaultRoom,
-        call_id: input.callID,
-        sender: cfg.agentName,
-        session_id: input.sessionID,
-        phase: 'before',
-        tool: input.tool,
-      });
+      postToolStatus(cfg, input, 'before');
     },
 
     'tool.execute.after': async (input, output) => {
       if (!activeSessionId) activeSessionId = input.sessionID;
-      await postJson(cfg.bearer, `${cfg.httpUrl}/api/tool-status`, {
-        room_id: cfg.defaultRoom,
-        call_id: input.callID,
-        sender: cfg.agentName,
-        session_id: input.sessionID,
-        phase: 'after',
-        tool: input.tool,
-        title: output.title,
-      });
+      postToolStatus(cfg, input, 'after', output.title);
     },
 
     // -------------------------------------------------------------------------
@@ -405,8 +574,10 @@ export const ChatroomVoice: Plugin = async (ctx): Promise<Hooks> => {
             .describe('Internal reasoning shown as a collapsible bubble (not spoken).'),
         },
         async execute(args, context) {
-          const room = args.room_id ?? cfg.defaultRoom;
-          const sessionId = activeSessionId ?? context.sessionID;
+          const { room, sessionId } = resolveCtx(args, context, cfg, activeSessionId);
+
+          const roomErr = validateRoomId(room);
+          if (roomErr) return { title: 'voice_reply error', output: roomErr };
 
           if (args.thought) {
             await postJson(cfg.bearer, `${cfg.httpUrl}/api/agent-stream-complete`, {
@@ -457,8 +628,10 @@ export const ChatroomVoice: Plugin = async (ctx): Promise<Hooks> => {
             .describe('Override the default room.'),
         },
         async execute(args, context) {
-          const room = args.room_id ?? cfg.defaultRoom;
-          const sessionId = activeSessionId ?? context.sessionID;
+          const { room, sessionId } = resolveCtx(args, context, cfg, activeSessionId);
+
+          const roomErr = validateRoomId(room);
+          if (roomErr) return { title: 'voice_markdown error', output: roomErr };
 
           await postJson(cfg.bearer, `${cfg.httpUrl}/api/agent-markdown`, {
             room_id: room,
@@ -491,8 +664,10 @@ export const ChatroomVoice: Plugin = async (ctx): Promise<Hooks> => {
             .describe('Override the default room.'),
         },
         async execute(args, context) {
-          const room = args.room_id ?? cfg.defaultRoom;
-          const sessionId = activeSessionId ?? context.sessionID;
+          const { room, sessionId } = resolveCtx(args, context, cfg, activeSessionId);
+
+          const roomErr = validateRoomId(room);
+          if (roomErr) return { title: 'voice_thought error', output: roomErr };
 
           await postJson(cfg.bearer, `${cfg.httpUrl}/api/agent-thought`, {
             room_id: room,
@@ -525,8 +700,10 @@ export const ChatroomVoice: Plugin = async (ctx): Promise<Hooks> => {
             .describe('Override the default room.'),
         },
         async execute(args, context) {
-          const room = args.room_id ?? cfg.defaultRoom;
-          const sessionId = activeSessionId ?? context.sessionID;
+          const { room, sessionId } = resolveCtx(args, context, cfg, activeSessionId);
+
+          const roomErr = validateRoomId(room);
+          if (roomErr) return { title: 'voice_mermaid error', output: roomErr };
 
           await postJson(cfg.bearer, `${cfg.httpUrl}/api/agent-mermaid`, {
             room_id: room,
@@ -561,8 +738,10 @@ export const ChatroomVoice: Plugin = async (ctx): Promise<Hooks> => {
             .describe('Override the default room.'),
         },
         async execute(args, context) {
-          const room = args.room_id ?? cfg.defaultRoom;
-          const sessionId = activeSessionId ?? context.sessionID;
+          const { room, sessionId } = resolveCtx(args, context, cfg, activeSessionId);
+
+          const roomErr = validateRoomId(room);
+          if (roomErr) return { title: 'voice_map error', output: roomErr };
 
           // Validate JSON structure before sending to avoid silently corrupt
           // payloads reaching the frontend.
