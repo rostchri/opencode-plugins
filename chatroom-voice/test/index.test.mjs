@@ -251,15 +251,23 @@ describe('chatroom-voice plugin', () => {
   it('voice_reply rejects invalid room_id', async () => {
     resetFetch();
     const hooks = await pluginModule.default(makeCtx());
+    // Drain async init heartbeat so it doesn't interfere with the assertion below.
+    await new Promise((r) => setTimeout(r, 30));
+    resetFetch();
+
     const result = await hooks.tool.voice_reply.execute(
       { text: 'hi', room_id: 'invalid room!', thought: undefined },
       makeToolCtx(),
     );
 
     assert.ok(result.output.toLowerCase().includes('invalid room_id'), `unexpected output: ${result.output}`);
-    // No fetch should have been called
-    const completeCalls = fetchCalls.filter((c) => c.url.includes('/api/'));
-    assert.equal(completeCalls.length, 0, 'should not make HTTP calls for invalid room');
+    // No stream-complete or markdown calls should have been made for an invalid room.
+    // (Heartbeat calls to /api/heartbeat are excluded from this check —
+    //  they come from the background heartbeat loop, not from voice_reply.)
+    const completeCalls = fetchCalls.filter(
+      (c) => c.url.includes('/api/agent-stream-complete') || c.url.includes('/api/agent-markdown'),
+    );
+    assert.equal(completeCalls.length, 0, 'should not make stream/markdown calls for invalid room');
   });
 
   // ---- voice_markdown ------------------------------------------------------
@@ -574,5 +582,151 @@ describe('chatroom-voice plugin', () => {
     // We cannot call process.emit('SIGTERM') safely in test as it exits the process.
     // Instead verify the hook shape is still valid after a second init.
     assert.equal(typeof hooks.event, 'function');
+  });
+
+  // ---- chat.message hook: model tracking + eager heartbeat ----------------
+
+  it('chat.message hook is exposed on the hooks object', async () => {
+    resetFetch();
+    const hooks = await pluginModule.default(makeCtx());
+    assert.equal(
+      typeof hooks['chat.message'],
+      'function',
+      'hooks["chat.message"] must be a function',
+    );
+  });
+
+  it('chat.message hook fires eager heartbeat when model changes', async () => {
+    resetFetch();
+    const hooks = await pluginModule.default(makeCtx());
+
+    // Simulate first chat turn with a model.
+    await hooks['chat.message']({
+      sessionID: 'sess-model-test',
+      model: { providerID: 'anthropic', modelID: 'claude-sonnet-4-6' },
+    });
+
+    // Give fire-and-forget microtask time to settle.
+    await new Promise((r) => setTimeout(r, 20));
+
+    // Heartbeat calls are POST /api/heartbeat.
+    const heartbeatCalls = fetchCalls.filter((c) => c.url.includes('/api/heartbeat'));
+    // Note: plugin init already fires one heartbeat (resolveRoomViaHeartbeat).
+    // The eager heartbeat from chat.message should add at least one more.
+    assert.ok(heartbeatCalls.length >= 1, 'should fire at least one heartbeat for model');
+
+    // The eager heartbeat must carry the model field.
+    const modelCall = heartbeatCalls.find((c) => c.body.model === 'anthropic/claude-sonnet-4-6');
+    assert.ok(modelCall, 'heartbeat should include model=anthropic/claude-sonnet-4-6');
+
+    resetFetch();
+  });
+
+  it('chat.message hook does NOT fire eager heartbeat on same model (no change)', async () => {
+    resetFetch();
+    const hooks = await pluginModule.default(makeCtx());
+
+    const modelInput = {
+      sessionID: 'sess-model-same',
+      model: { providerID: 'anthropic', modelID: 'claude-haiku-4' },
+    };
+
+    // First call — sets the model and fires a heartbeat.
+    await hooks['chat.message'](modelInput);
+    await new Promise((r) => setTimeout(r, 20));
+
+    const afterFirst = fetchCalls.filter((c) => c.url.includes('/api/heartbeat')).length;
+
+    resetFetch();
+
+    // Second call — same model — should NOT fire another eager heartbeat.
+    await hooks['chat.message'](modelInput);
+    await new Promise((r) => setTimeout(r, 20));
+
+    const afterSecond = fetchCalls.filter((c) => c.url.includes('/api/heartbeat')).length;
+    assert.equal(afterSecond, 0, 'no extra heartbeat on repeated same model');
+
+    resetFetch();
+  });
+
+  it('chat.message hook fires again when model changes a second time', async () => {
+    resetFetch();
+    const hooks = await pluginModule.default(makeCtx());
+
+    // First model.
+    await hooks['chat.message']({
+      sessionID: 'sess-switch',
+      model: { providerID: 'openai', modelID: 'gpt-4o' },
+    });
+    await new Promise((r) => setTimeout(r, 20));
+
+    resetFetch();
+
+    // Second model — different.
+    await hooks['chat.message']({
+      sessionID: 'sess-switch',
+      model: { providerID: 'anthropic', modelID: 'claude-opus-4' },
+    });
+    await new Promise((r) => setTimeout(r, 20));
+
+    const heartbeatCalls = fetchCalls.filter((c) => c.url.includes('/api/heartbeat'));
+    assert.ok(heartbeatCalls.length >= 1, 'should fire heartbeat on model switch');
+
+    const switchCall = heartbeatCalls.find((c) => c.body.model === 'anthropic/claude-opus-4');
+    assert.ok(switchCall, 'heartbeat should carry new model=anthropic/claude-opus-4');
+
+    resetFetch();
+  });
+
+  it('chat.message hook with no model field does not fire eager heartbeat', async () => {
+    resetFetch();
+    const hooks = await pluginModule.default(makeCtx());
+
+    // Drain any async heartbeat from the plugin init phase before measuring.
+    await new Promise((r) => setTimeout(r, 30));
+    resetFetch();
+
+    // Turn without model info — should be a no-op for the eager heartbeat path.
+    await hooks['chat.message']({ sessionID: 'sess-nomodel' });
+    await new Promise((r) => setTimeout(r, 20));
+
+    const heartbeatCalls = fetchCalls.filter((c) => c.url.includes('/api/heartbeat'));
+    assert.equal(heartbeatCalls.length, 0, 'no heartbeat when model is absent');
+
+    resetFetch();
+  });
+
+  it('chat.message hook does not send model in tool-status body', async () => {
+    resetFetch();
+    const hooks = await pluginModule.default(makeCtx());
+
+    // Set a model first.
+    await hooks['chat.message']({
+      sessionID: 'sess-toolcheck',
+      model: { providerID: 'anthropic', modelID: 'claude-opus-4' },
+    });
+    await new Promise((r) => setTimeout(r, 20));
+
+    resetFetch();
+
+    // Trigger a tool.execute.before hook.
+    await hooks['tool.execute.before']({
+      callID: 'call-xyz',
+      sessionID: 'sess-toolcheck',
+      tool: 'bash',
+    });
+
+    const toolStatusCalls = fetchCalls.filter((c) => c.url.includes('/api/tool-status'));
+    assert.ok(toolStatusCalls.length >= 1, 'tool-status should be called');
+
+    // model must NOT appear in tool-status payloads.
+    for (const call of toolStatusCalls) {
+      assert.ok(
+        !('model' in call.body),
+        `tool-status body must not contain model field, got: ${JSON.stringify(call.body)}`,
+      );
+    }
+
+    resetFetch();
   });
 });
