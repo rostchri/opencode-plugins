@@ -65,12 +65,131 @@ function validateRoomId(room: string): string | undefined {
 /** Max inbound text size in bytes (mirrors server.mjs 50 KB limit). */
 const MAX_INBOUND_BYTES = 50_000;
 
+/** Safe accessor for event.properties as an indexed record. */
+function ev_props(event: { properties?: unknown }): Record<string, unknown> {
+  const p = event.properties;
+  return typeof p === 'object' && p !== null ? (p as Record<string, unknown>) : {};
+}
+
+/**
+ * System-prompt block appended to opencode's built-in mode prompt via the
+ * `experimental.chat.system.transform` hook. Kept short on purpose — the
+ * normal terminal output stream (text + reasoning) is already forwarded
+ * automatically by our event-hook, so we don't need to advertise tools like
+ * `voice_reply` / `voice_thought` / `voice_markdown`.
+ */
+const VOICE_MODE_SYSTEM_PROMPT = `You are connected to a browser voice chat via the chatroom-voice plugin.
+User messages arrive as plain text (after STT from microphone).
+
+Your normal terminal output streams live to the browser — text parts go
+through TTS automatically, reasoning shows as collapsible bubble. Just
+reply naturally, no special tool needed for normal answers.
+
+For rich content use:
+- \`voice_mermaid\` — diagrams
+- \`voice_map\` — interactive maps
+
+Reply in the user's language (German default). Use real umlauts (ä/ö/ü/ß)
+— TTS mispronounces ae/oe/ue.`;
+
+/**
+ * Periodic heartbeat interval (ms) to keep the backend's session-presence
+ * record fresh. Room changes are picked up event-driven via the
+ * `agent_moved` channel event (no polling needed), so this can be a slow
+ * liveness ping rather than a tight room-sync loop.
+ */
+const HEARTBEAT_INTERVAL_MS = 60_000;
+
+/**
+ * Stable, deterministic session id for this plugin instance. Used as the
+ * `session_id` on /api/heartbeat so the backend can map our agent to a
+ * persistent room across restarts.
+ *
+ * Priority: env override → hash(agentName + wsUrl + hostname).
+ */
+function deriveAgentSessionId(cfg: Config): string {
+  if (cfg.sessionId && cfg.sessionId.trim()) return cfg.sessionId.trim();
+  const hostname = process.env['HOSTNAME'] ?? 'unknown';
+  const seed = `${cfg.agentName}|${cfg.wsUrl}|${hostname}`;
+  // Lightweight stable hash (no crypto dep). 32-bit FNV-1a → hex.
+  let h = 0x811c9dc5;
+  for (let i = 0; i < seed.length; i++) {
+    h ^= seed.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return `${cfg.agentName}-${h.toString(16).padStart(8, '0')}`;
+}
+
+/**
+ * Ask the backend which room this agent belongs in. Backend response is the
+ * authoritative source — never trust env-vars or persisted state on disk for
+ * room assignment. Backend resolves: SessionServer > RoomPersistence > Default.
+ */
+async function resolveRoomViaHeartbeat(
+  cfg: Config,
+  sessionId: string,
+  model: string | undefined,
+): Promise<string | undefined> {
+  try {
+    const res = await fetch(`${cfg.httpUrl}/api/heartbeat`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${cfg.bearer}`,
+      },
+      body: JSON.stringify({
+        session_id: sessionId,
+        name: cfg.agentName,
+        type: 'agent',
+        agent_identity: sessionId,
+        agent_type: 'opencode',
+        ...(model ? { model } : {}),
+      }),
+    });
+    if (!res.ok) {
+      debugLog(
+        `[chatroom-voice] heartbeat HTTP ${res.status} — falling back to env room\n`,
+      );
+      return undefined;
+    }
+    const body = (await res.json()) as { room_id?: string };
+    return typeof body.room_id === 'string' && body.room_id ? body.room_id : undefined;
+  } catch (err) {
+    debugLog(
+      `[chatroom-voice] heartbeat failed: ${String(err)} — falling back to env room\n`,
+    );
+    return undefined;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
 
 /** Emitted once per process to avoid log-spam in tests. */
 let bearerWarnEmitted = false;
+
+/**
+ * Append a line to ~/.opencode-chatroom-voice.log. opencode's TUI swallows
+ * `process.stderr.write` from plugins, so we route diagnostic logs to a
+ * dedicated file the user can `tail -f` from another terminal.
+ */
+function debugLog(line: string): void {
+  try {
+    const homedir = process.env['HOME'] ?? '/tmp';
+    const path = `${homedir}/.opencode-chatroom-voice.log`;
+    const ts = new Date().toISOString();
+    void import('node:fs').then((fs) => {
+      try {
+        fs.appendFileSync(path, `[${ts}] ${line}\n`);
+      } catch {
+        /* swallowed */
+      }
+    });
+  } catch {
+    /* swallowed */
+  }
+}
 
 interface Config {
   wsUrl: string;
@@ -100,7 +219,7 @@ function loadConfig(): Config {
   // See issue #2329 for short-lived token mitigation (requires backend change).
   if (!bearerWarnEmitted) {
     bearerWarnEmitted = true;
-    process.stderr.write(
+    debugLog(
       '[chatroom-voice] WARN: Bearer token is passed as a Phoenix Socket param ' +
       '(query string in WS upgrade). Token may appear in reverse-proxy access logs. ' +
       'See issue #2329 for short-lived token mitigation.\n',
@@ -149,15 +268,15 @@ async function postJson(
     });
     if (!res.ok) {
       const text = await res.text().catch(() => '');
-      process.stderr.write(
+      debugLog(
         `[chatroom-voice] POST ${url} → ${res.status}: ${text}\n`,
       );
     }
   } catch (err) {
     if (err instanceof Error && err.name === 'AbortError') {
-      process.stderr.write(`[chatroom-voice] POST ${url} timed out after ${POST_TIMEOUT_MS}ms\n`);
+      debugLog(`[chatroom-voice] POST ${url} timed out after ${POST_TIMEOUT_MS}ms\n`);
     } else {
-      process.stderr.write(`[chatroom-voice] POST ${url} failed: ${String(err)}\n`);
+      debugLog(`[chatroom-voice] POST ${url} failed: ${String(err)}\n`);
     }
   } finally {
     clearTimeout(timer);
@@ -176,7 +295,7 @@ function postJsonFireAndForget(
 ): void {
   postJson(bearer, url, body).catch((err: unknown) => {
     // postJson already swallows errors internally; this is a safety net.
-    process.stderr.write(`[chatroom-voice] Unexpected postJson throw: ${String(err)}\n`);
+    debugLog(`[chatroom-voice] Unexpected postJson throw: ${String(err)}\n`);
   });
 }
 
@@ -280,70 +399,133 @@ function postToolStatus(
  */
 async function openPhoenixChannel(
   cfg: Config,
+  agentSessionId: string,
+  initialRoom: string,
   getSessionId: () => string | undefined,
+  getActiveModel: () => string | undefined,
   promptAsync: (sessionId: string, text: string) => Promise<void>,
 ): Promise<() => void> {
   // Dynamic import so the module can be tree-shaken / mocked in tests.
   // Use the declared types from phoenix.d.ts — no inline cast needed.
   const { Socket } = await import('phoenix');
 
+  // Phoenix Socket appends "/websocket" (or "/longpoll") to the base URL
+  // itself. If the env-var already contains it, strip it so we don't end up
+  // with "/socket/websocket/websocket" → 404.
   const wsUrl = cfg.wsUrl.endsWith('/websocket')
-    ? cfg.wsUrl
-    : `${cfg.wsUrl}/websocket`;
+    ? cfg.wsUrl.slice(0, -'/websocket'.length)
+    : cfg.wsUrl;
+
+  // Node < 22 has no global WebSocket; the phoenix client otherwise silently
+  // falls back to LongPoll which our backend does not serve (404 "not found"
+  // parse errors). Load the `ws` polyfill and pass it as the `transport`
+  // option so Socket() always uses a real WebSocket.
+  let transport: unknown = (globalThis as { WebSocket?: unknown }).WebSocket;
+  if (!transport) {
+    try {
+      const wsMod = (await import('ws')) as { default?: unknown };
+      transport = wsMod.default ?? wsMod;
+    } catch {
+      // Fall back to whatever phoenix picks (LongPoll). The user will see the
+      // "failed to parse JSON response" loop in stderr and can install `ws`.
+    }
+  }
 
   const socket: Socket = new Socket(wsUrl, {
     params: {
       token: cfg.bearer,
-      identity: cfg.sessionId ?? 'opencode',
+      identity: agentSessionId,
     },
-  });
+    ...(transport ? { transport } : {}),
+  } as ConstructorParameters<typeof Socket>[1]);
 
   socket.connect();
 
-  const channel: Channel = socket.channel(`room:${cfg.defaultRoom}`, {});
+  // State for the single active room subscription. Single-room is the agent
+  // contract (vs browser/user which can multi-room). Room changes are picked
+  // up event-driven via `agent_moved` from the backend AgentMover.
+  let currentRoom = initialRoom;
+  let leaveCurrent: () => void;
 
-  // Store listener reference so we can cleanly call channel.off() on teardown.
-  const messageListenerRef: number = channel.on('message', (payload: unknown) => {
-    const p = payload as Record<string, unknown>;
-    const text = typeof p['text'] === 'string' ? p['text'] : String(p['body'] ?? '');
-    if (!text.trim()) return;
+  /** Subscribe to a single room. Returns a leave-fn that detaches listeners. */
+  const subscribe = (roomId: string): (() => void) => {
+    const channel: Channel = socket.channel(`room:${roomId}`, {});
 
-    // Size guard: reject oversized inbound payloads (mirrors server.mjs 50 KB limit).
-    if (Buffer.byteLength(text, 'utf8') > MAX_INBOUND_BYTES) {
-      process.stderr.write(
-        `[chatroom-voice] Inbound message rejected — exceeds ${MAX_INBOUND_BYTES} bytes\n`,
-      );
-      return;
-    }
+    const messageListenerRef: number = channel.on('message', (payload: unknown) => {
+      const p = payload as Record<string, unknown>;
+      const text = typeof p['text'] === 'string' ? p['text'] : String(p['body'] ?? '');
+      if (!text.trim()) return;
 
-    const sid = getSessionId();
-    if (!sid) {
-      process.stderr.write('[chatroom-voice] Inbound message dropped — no active session\n');
-      return;
-    }
+      if (Buffer.byteLength(text, 'utf8') > MAX_INBOUND_BYTES) {
+        debugLog(
+          `[chatroom-voice] Inbound message rejected — exceeds ${MAX_INBOUND_BYTES} bytes\n`,
+        );
+        return;
+      }
 
-    promptAsync(sid, text).catch((err: unknown) => {
-      process.stderr.write(`[chatroom-voice] promptAsync failed: ${String(err)}\n`);
+      const sid = getSessionId();
+      if (!sid) {
+        debugLog('[chatroom-voice] Inbound message dropped — no active session\n');
+        return;
+      }
+
+      promptAsync(sid, text).catch((err: unknown) => {
+        debugLog(`[chatroom-voice] promptAsync failed: ${String(err)}\n`);
+      });
     });
-  });
 
-  channel
-    .join()
-    .receive('ok', () => {
-      process.stderr.write(
-        `[chatroom-voice] Joined room:${cfg.defaultRoom} on ${cfg.wsUrl}\n`,
+    // Event-driven room reassignment: backend AgentMover.move/3 broadcasts
+    // `agent_moved` on both old and new room. We filter by our own
+    // agent_session_id and switch channels in-process.
+    const movedListenerRef: number = channel.on('agent_moved', (payload: unknown) => {
+      const p = payload as Record<string, unknown>;
+      if (p['session_id'] !== agentSessionId) return; // not us
+      const target = typeof p['to_room'] === 'string' ? p['to_room'] : undefined;
+      if (!target || target === currentRoom) return;
+      debugLog(
+        `[chatroom-voice] agent_moved: ${currentRoom} → ${target}\n`,
       );
-    })
-    .receive('error', (resp: unknown) => {
-      process.stderr.write(
-        `[chatroom-voice] Channel join error: ${JSON.stringify(resp)}\n`,
-      );
+      try { leaveCurrent(); } catch { /* noop */ }
+      currentRoom = target;
+      leaveCurrent = subscribe(currentRoom);
     });
+
+    channel
+      .join()
+      .receive('ok', () => {
+        debugLog(
+          `[chatroom-voice] Joined room:${roomId} as agent_session=${agentSessionId}\n`,
+        );
+      })
+      .receive('error', (resp: unknown) => {
+        debugLog(
+          `[chatroom-voice] Channel join error (room:${roomId}): ${JSON.stringify(resp)}\n`,
+        );
+      });
+
+    return () => {
+      channel.off('message', messageListenerRef);
+      channel.off('agent_moved', movedListenerRef);
+      channel.leave();
+    };
+  };
+
+  leaveCurrent = subscribe(currentRoom);
+
+  // Slow liveness heartbeat: keeps backend's session_presence fresh and
+  // updates `model` metadata. Room changes are event-driven via agent_moved,
+  // so the heartbeat does NOT need to drive room sync.
+  const heartbeatTimer = setInterval(() => {
+    void resolveRoomViaHeartbeat(cfg, agentSessionId, getActiveModel());
+  }, HEARTBEAT_INTERVAL_MS);
+  // Don't keep the event loop alive for the timer alone.
+  if (typeof (heartbeatTimer as { unref?: () => void }).unref === 'function') {
+    (heartbeatTimer as { unref?: () => void }).unref!();
+  }
 
   return () => {
-    // Clean up listener before leaving to prevent listener leaks on reconnect.
-    channel.off('message', messageListenerRef);
-    channel.leave();
+    clearInterval(heartbeatTimer);
+    try { leaveCurrent(); } catch { /* noop */ }
     socket.disconnect();
   };
 }
@@ -360,6 +542,13 @@ export const ChatroomVoice: Plugin = async (ctx): Promise<Hooks> => {
   // tool.execute.before / event hooks on first use.
   let activeSessionId: string | undefined = cfg.sessionId;
 
+  // Track the currently active LLM model so we can report it to the backend
+  // via /api/heartbeat. opencode emits the model on every chat.message call;
+  // we update on change and send an eager heartbeat immediately so the backend
+  // picks up the new model without waiting for the 60-second periodic tick.
+  let activeModel: string | undefined;
+  const getActiveModel = (): string | undefined => activeModel;
+
   /** Inject a user text message into the active opencode session. */
   const promptAsync = async (sessionId: string, text: string): Promise<void> => {
     await ctx.client.session.promptAsync({
@@ -371,16 +560,25 @@ export const ChatroomVoice: Plugin = async (ctx): Promise<Hooks> => {
   };
 
   // Open the Phoenix Channel for inbound user messages.
+  // Agent room is backend-authoritative: ask /api/heartbeat first, fall back
+  // to cfg.defaultRoom only if the backend is unreachable. Single-room is the
+  // agent contract (vs. browser/user which can be in many rooms).
   // Failure here is non-fatal — the outbound tools still work.
+  const agentSessionId = deriveAgentSessionId(cfg);
+  const resolvedRoom =
+    (await resolveRoomViaHeartbeat(cfg, agentSessionId, activeModel)) ?? cfg.defaultRoom;
   let cleanupChannel: (() => void) | undefined;
   try {
     cleanupChannel = await openPhoenixChannel(
       cfg,
+      agentSessionId,
+      resolvedRoom,
       () => activeSessionId,
+      getActiveModel,
       promptAsync,
     );
   } catch (err) {
-    process.stderr.write(
+    debugLog(
       `[chatroom-voice] Phoenix Channel unavailable: ${String(err)}\n` +
       `[chatroom-voice] Inbound voice disabled; outbound tools still active.\n`,
     );
@@ -394,7 +592,7 @@ export const ChatroomVoice: Plugin = async (ctx): Promise<Hooks> => {
       cleanupChannel = undefined;
     }
     const timer = setTimeout(() => {
-      process.stderr.write('[chatroom-voice] Shutdown timeout — force exit\n');
+      debugLog('[chatroom-voice] Shutdown timeout — force exit\n');
       process.exit(0);
     }, 2_000);
     // unref() so the timer does not prevent a clean exit if nothing else keeps
@@ -420,9 +618,52 @@ export const ChatroomVoice: Plugin = async (ctx): Promise<Hooks> => {
 
   const hooks: Hooks = {
     // -------------------------------------------------------------------------
+    // chat.message hook — model tracking + eager heartbeat on model change
+    //
+    // opencode calls this hook for every chat turn. The `input.model` field
+    // carries { providerID, modelID } for the model that will handle the turn.
+    // We derive a canonical "<providerID>/<modelID>" string, update `activeModel`
+    // when it changes, and fire an eager heartbeat immediately so the backend
+    // receives the new model without waiting for the 60 s periodic tick.
+    //
+    // `input.sessionID` is captured as a fallback for `activeSessionId` so the
+    // inbound message path works even before the first event hook fires.
+    // -------------------------------------------------------------------------
+    'chat.message': async (input) => {
+      // Capture sessionID if not yet known.
+      const sid = (input as unknown as Record<string, unknown>)['sessionID'];
+      if (typeof sid === 'string' && sid && !activeSessionId) {
+        activeSessionId = sid;
+      }
+
+      // Derive canonical model string from input.model (providerID + modelID).
+      const rawModel = (input as unknown as Record<string, unknown>)['model'] as
+        | { providerID?: string; modelID?: string }
+        | undefined;
+      const newModel =
+        rawModel && rawModel.providerID && rawModel.modelID
+          ? `${rawModel.providerID}/${rawModel.modelID}`
+          : undefined;
+
+      if (newModel && newModel !== activeModel) {
+        activeModel = newModel;
+        debugLog(`[chatroom-voice] model changed → ${activeModel} — eager heartbeat\n`);
+        // Eager heartbeat: fire-and-forget so we don't block the turn.
+        // The return value (room_id) is intentionally discarded here — room
+        // assignments are handled by agent_moved events.
+        void resolveRoomViaHeartbeat(cfg, agentSessionId, activeModel);
+      }
+    },
+
+    // -------------------------------------------------------------------------
     // Event hook
     // -------------------------------------------------------------------------
     event: async ({ event }) => {
+      // DEBUG: log every event type to ~/.opencode-chatroom-voice.log so we
+      // can inspect what opencode actually emits.
+      if (process.env['OPENCODE_VOICE_DEBUG']) {
+        debugLog(`event type=${event.type}`);
+      }
       // -- Inbound session tracking --
       // Capture the session ID from session-status events so inbound messages
       // can be routed even if no env-override was provided.
@@ -438,17 +679,73 @@ export const ChatroomVoice: Plugin = async (ctx): Promise<Hooks> => {
       }
 
       // -- Streaming delta (token by token) --
+      // opencode publishes two related events on its bus:
+      //   - `message.part.delta`    — frequent token-by-token stream
+      //   - `message.part.updated`  — less frequent state snapshots, may also
+      //                               carry a `delta` field
+      // The SDK type only describes `.updated`, but `.delta` is the actual
+      // hot-path stream observed at runtime — handle both.
+      // -- message.part.delta — the actual token-by-token stream --
+      // Shape: properties = { sessionID, messageID, partID, field, delta }.
+      // `field` is the part attribute being appended to ("text" or "reasoning"
+      // for AssistantMessage parts). NO `part` object — only the delta string.
+      if ((event.type as string) === 'message.part.delta') {
+        const props = ev_props(event);
+        const delta = typeof props['delta'] === 'string' ? props['delta'] : '';
+        if (!delta) return;
+        const field = typeof props['field'] === 'string' ? props['field'] : 'text';
+        if (field !== 'text' && field !== 'reasoning') return;
+        const sessionId = typeof props['sessionID'] === 'string' ? props['sessionID'] : '';
+        const messageId = typeof props['messageID'] === 'string' ? props['messageID'] : '';
+        const partId = typeof props['partID'] === 'string' ? props['partID'] : '';
+        if (!sessionId || !messageId || !partId) return;
+        const kind: 'text' | 'thought' = field === 'reasoning' ? 'thought' : 'text';
+
+        if (sessionId && !activeSessionId) activeSessionId = sessionId;
+        evictStaleParts(partBuffer);
+        if (partBuffer.size >= PART_BUFFER_MAX) {
+          debugLog(`partBuffer cap (${PART_BUFFER_MAX}) — clearing`);
+          partBuffer.clear();
+        }
+        const existing = partBuffer.get(partId);
+        if (existing) {
+          existing.chunks.push(delta);
+          existing.lastUpdatedAt = Date.now();
+        } else {
+          partBuffer.set(partId, { kind, chunks: [delta], messageId, lastUpdatedAt: Date.now() });
+        }
+        if (process.env['OPENCODE_VOICE_DEBUG']) {
+          debugLog(`  POST agent-stream-delta msg=${messageId} kind=${kind} delta="${delta.slice(0, 30)}"`);
+        }
+        postJsonFireAndForget(cfg.bearer, `${cfg.httpUrl}/api/agent-stream-delta`, {
+          message_id: messageId,
+          sender: cfg.agentName,
+          session_id: sessionId,
+          kind,
+          delta,
+        });
+        return;
+      }
+
+      // -- message.part.updated — full part-shape snapshot, no delta inside --
+      // We skip these here: the token stream goes through .delta above, and
+      // message.updated (assistant complete) flushes the buffer below.
       if (event.type === 'message.part.updated') {
         const ev = event as EventMessagePartUpdated;
         const delta = ev.properties.delta;
-        if (!delta) return;
 
+        // `message.part.delta` events frequently arrive without a populated
+        // `part` object — only the delta string is present until a later
+        // `.updated` snapshot fills the shape. Skip until we have a part.
         const part = ev.properties.part;
+        if (!part || typeof part !== 'object') return;
         if (part.type !== 'text' && part.type !== 'reasoning') return;
+        if (!delta) return; // .updated snapshots without delta — ignore
 
         const kind: 'text' | 'thought' = part.type === 'reasoning' ? 'thought' : 'text';
         const sessionId = part.sessionID;
         const messageId = part.messageID;
+        if (!sessionId || !messageId) return;
 
         // Track the active session from stream events as well.
         if (sessionId && !activeSessionId) activeSessionId = sessionId;
@@ -458,7 +755,7 @@ export const ChatroomVoice: Plugin = async (ctx): Promise<Hooks> => {
 
         // Size-cap guard: warn and clear when buffer grows too large.
         if (partBuffer.size >= PART_BUFFER_MAX) {
-          process.stderr.write(
+          debugLog(
             `[chatroom-voice] WARN: partBuffer size cap (${PART_BUFFER_MAX}) reached — clearing stale entries\n`,
           );
           partBuffer.clear();
@@ -527,6 +824,15 @@ export const ChatroomVoice: Plugin = async (ctx): Promise<Hooks> => {
         await Promise.all(flushPromises);
         return;
       }
+    },
+
+    // -------------------------------------------------------------------------
+    // System-prompt injection — tell the LLM it's connected to a voice chat
+    // and what to do with normal output vs. the explicit voice_mermaid/map
+    // tools. Append so opencode's built-in mode prompt stays intact.
+    // -------------------------------------------------------------------------
+    'experimental.chat.system.transform': async (_input, output) => {
+      output.system.push(VOICE_MODE_SYSTEM_PROMPT);
     },
 
     // -------------------------------------------------------------------------
@@ -775,6 +1081,11 @@ export const ChatroomVoice: Plugin = async (ctx): Promise<Hooks> => {
   return hooks;
 };
 
+// Display name for `/status`: opencode reads dirname-basename when loading a
+// plugin via file:// URL, which yields "dist" for everyone using a tsc/bun
+// build output. Attach `id` directly on the function so the runtime can pick
+// it up if it supports that convention.
+(ChatroomVoice as unknown as { id?: string }).id = 'chatroom-voice';
 export default ChatroomVoice;
 
 // Compatibility export for opencode plugin loader which expects a named `server` export.
