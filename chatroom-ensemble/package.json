@@ -6,7 +6,8 @@
   "types": "dist/index.d.ts",
   "type": "module",
   "scripts": {
-    "build": "tsc",
+    "build": "esbuild src/index.ts --bundle --format=esm --platform=node --outfile=dist/index.js",
+    "build:tsc": "tsc",
     "dev": "tsc --watch"
   },
   "dependencies": {
@@ -19,6 +20,7 @@
     "@types/node": "^22.0.0",
     "@types/phoenix": "^1.6.7",
     "@types/ws": "^8.5.10",
+    "esbuild": "^0.28.0",
     "typescript": "^5.5.4"
   }
 }

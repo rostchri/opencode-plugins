@@ -11,11 +11,25 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 function loadPreset() {
-    const presetPath = path.join(__dirname, '../../docs/st-chat-settings.json');
-    if (fs.existsSync(presetPath)) {
-        return new HeadlessPromptManager(presetPath);
+    // After bundling, __dirname points to dist/ (where dist/index.js lives).
+    // The symlink (chatroom-ensemble.js -> dist/index.js) does NOT change __dirname —
+    // import.meta.url still resolves to the real file inside dist/.
+    // So relative to dist/:
+    //   '../docs'  => Plugin-Root/docs  (CORRECT: docs/ is a sibling of dist/)
+    //   '../../docs' => Plugin-Root/../docs (WRONG: one level too high)
+    // We probe both candidates so the code survives future layout changes.
+    const candidates = [
+        path.join(__dirname, '../docs/st-chat-settings.json'),
+        path.join(__dirname, '../../docs/st-chat-settings.json'),
+        path.join(__dirname, 'docs/st-chat-settings.json'),
+    ];
+    for (const candidate of candidates) {
+        if (fs.existsSync(candidate)) {
+            console.log(`[chatroom-ensemble] Loading preset from ${candidate}`);
+            return new HeadlessPromptManager(candidate);
+        }
     }
-    throw new Error(`Preset not found at ${presetPath}`);
+    throw new Error(`Preset not found. Tried:\n${candidates.join('\n')}`);
 }
 
 async function streamOpenRouterCompatibleAPI(messages: any[], model: string, apiKey: string, baseUrl: string, onChunk: (text: string) => void) {
