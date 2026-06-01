@@ -98,7 +98,7 @@ Reply in the user's language (German default). Use real umlauts (ä/ö/ü/ß)
  * `agent_moved` channel event (no polling needed), so this can be a slow
  * liveness ping rather than a tight room-sync loop.
  */
-const HEARTBEAT_INTERVAL_MS = 60_000;
+const HEARTBEAT_INTERVAL_MS = 30_000;
 
 /**
  * Stable, deterministic session id for this plugin instance. Used as the
@@ -131,11 +131,17 @@ async function resolveRoomViaHeartbeat(
   model: string | undefined,
 ): Promise<string | undefined> {
   try {
+    // `Connection: close` defeats undici's keep-alive pool — long-idle
+    // connections often get closed server-side, but the pool keeps handing
+    // them out until the next request fails with `socket connection closed
+    // unexpectedly`. Forcing a fresh TCP connection per heartbeat costs us
+    // a few ms but eliminates the false-offline cycle.
     const res = await fetch(`${cfg.httpUrl}/api/heartbeat`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${cfg.bearer}`,
+        'Connection': 'close',
       },
       body: JSON.stringify({
         session_id: sessionId,
@@ -152,7 +158,29 @@ async function resolveRoomViaHeartbeat(
       );
       return undefined;
     }
-    const body = (await res.json()) as { room_id?: string };
+    const body = (await res.json()) as {
+      room_id?: string;
+      observer?: {
+        mode?: string;
+        room_id?: string;
+        display_char_name?: string;
+        system_prompt?: string;
+      };
+    };
+    // 2026-05-29: Cache observer-state aus heartbeat-response — wird im
+    // chat.system.transform-Hook abgefragt um den User-spezifischen
+    // Beobachter-System-Prompt ans LLM anzuhaengen.
+    if (body.observer && body.observer.mode === 'observer_in_room') {
+      observerStateCache = {
+        roomId: typeof body.observer.room_id === 'string' ? body.observer.room_id : '',
+        displayCharName:
+          typeof body.observer.display_char_name === 'string' ? body.observer.display_char_name : '',
+        systemPrompt:
+          typeof body.observer.system_prompt === 'string' ? body.observer.system_prompt : '',
+      };
+    } else {
+      observerStateCache = null;
+    }
     return typeof body.room_id === 'string' && body.room_id ? body.room_id : undefined;
   } catch (err) {
     debugLog(
@@ -168,6 +196,18 @@ async function resolveRoomViaHeartbeat(
 
 /** Emitted once per process to avoid log-spam in tests. */
 let bearerWarnEmitted = false;
+
+/**
+ * Observer-Mode-Cache: vom Heartbeat-Response gefuellt (Backend leitet den
+ * vom Browser-User per setup_observer Modal eingegebenen system_prompt an
+ * den Agenten weiter). Wird im chat.system.transform-Hook abgefragt damit
+ * der LLM diese Anweisung als zusaetzlichen System-Prompt-Block bekommt.
+ */
+let observerStateCache: {
+  roomId: string;
+  displayCharName: string;
+  systemPrompt: string;
+} | null = null;
 
 /**
  * Append a line to ~/.opencode-chatroom-voice.log. opencode's TUI swallows
@@ -257,11 +297,14 @@ async function postJson(
   const timer = setTimeout(() => controller.abort(), POST_TIMEOUT_MS);
 
   try {
+    // `Connection: close` (see heartbeat) — avoids undici keep-alive stale
+    // sockets on hot-path POSTs after the controller has restarted.
     const res = await fetch(url, {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${bearer}`,
         'Content-Type': 'application/json',
+        'Connection': 'close',
       },
       body: JSON.stringify(body),
       signal: controller.signal,
@@ -284,19 +327,37 @@ async function postJson(
 }
 
 /**
- * Fire-and-forget variant of postJson for hot-path delta events.
- * The Promise is intentionally not awaited to avoid blocking the event loop
- * when the backend is slow or unavailable. Errors are still logged via postJson.
+ * Per-URL serialized POST queue (#2026-05-29 ordering fix).
+ *
+ * Background: opencode emits text-deltas at sub-ms intervals. `fetch` with
+ * `Connection: close` spawns a fresh TCP socket per POST — so multiple
+ * concurrent POSTs race against each other and can arrive at the backend
+ * out-of-order (observed: token "OpenCode" reached backend 3ms before
+ * " bin **" although the LLM emitted them in the reverse order).
+ *
+ * Phoenix.Channel broadcasts in receive-order, so out-of-order HTTP arrival
+ * produces visually-glitching deltas in the browser AND — more critically —
+ * a corrupted text that the TTS-paragraph-segmenter then synthesizes
+ * before the final snapshot corrects the bubble.
+ *
+ * Fix: chain POSTs per target URL with `.then` so each request only fires
+ * AFTER the previous one resolved. Errors do not break the chain (the
+ * `.catch` continues the next request unconditionally).
  */
+const postChains = new Map<string, Promise<unknown>>();
 function postJsonFireAndForget(
   bearer: string,
   url: string,
   body: Record<string, unknown>,
 ): void {
-  postJson(bearer, url, body).catch((err: unknown) => {
-    // postJson already swallows errors internally; this is a safety net.
-    debugLog(`[chatroom-voice] Unexpected postJson throw: ${String(err)}\n`);
-  });
+  const prev = postChains.get(url) ?? Promise.resolve();
+  const next = prev
+    .catch(() => {}) // never break the chain on previous failure
+    .then(() => postJson(bearer, url, body))
+    .catch((err: unknown) => {
+      debugLog(`[chatroom-voice] Unexpected postJson throw: ${String(err)}\n`);
+    });
+  postChains.set(url, next);
 }
 
 // ---------------------------------------------------------------------------
@@ -392,7 +453,14 @@ function postToolStatus(
  *
  * Message events arriving from the room are injected into the opencode session
  * via `client.session.promptAsync`. If no active session ID is known at event
- * time, the message is silently dropped (the agent is not yet ready).
+ * time, the message is dropped with a clear log line.
+ *
+ * `resolveSessionId` defaults to `async () => getSessionId()` — i.e. it just
+ * reads the module-level `activeSessionId` variable. Callers SHOULD NOT pass a
+ * fallback that calls `session.list()` because list() returns ALL historical
+ * sessions sorted by creation time, not the session the TUI is currently
+ * displaying. The correct seeding strategy is `seedSessionFromStatusApi()` at
+ * init time + lifecycle-event hooks (session.created / session.status).
  *
  * Inbound text larger than MAX_INBOUND_BYTES is rejected with a WARN log to
  * prevent oversized payloads from flooding the session queue.
@@ -404,6 +472,7 @@ async function openPhoenixChannel(
   getSessionId: () => string | undefined,
   getActiveModel: () => string | undefined,
   promptAsync: (sessionId: string, text: string) => Promise<void>,
+  resolveSessionId: () => Promise<string | undefined> = async () => getSessionId(),
 ): Promise<() => void> {
   // Dynamic import so the module can be tree-shaken / mocked in tests.
   // Use the declared types from phoenix.d.ts — no inline cast needed.
@@ -463,15 +532,107 @@ async function openPhoenixChannel(
         return;
       }
 
-      const sid = getSessionId();
-      if (!sid) {
-        debugLog('[chatroom-voice] Inbound message dropped — no active session\n');
-        return;
-      }
-
-      promptAsync(sid, text).catch((err: unknown) => {
-        debugLog(`[chatroom-voice] promptAsync failed: ${String(err)}\n`);
+      // Route inbound message to the active session. activeSessionId is seeded
+      // at init via seedSessionFromStatusApi() + session.created/status events.
+      // If it is still undefined here, opencode has no active session — drop
+      // the message and log clearly so the user can diagnose the issue.
+      void resolveSessionId().then((sid) => {
+        if (!sid) {
+          debugLog('[chatroom-voice] Inbound message dropped — no active opencode session\n');
+          return;
+        }
+        promptAsync(sid, text).catch((err: unknown) => {
+          debugLog(`[chatroom-voice] promptAsync failed: ${String(err)}\n`);
+        });
       });
+    });
+
+    // 2026-05-29: opencode-Agent soll in Roleplay-Raeumen auch die Beitraege
+    // anderer Agents (Roleplay-Charakter) lesen koennen — analog dem
+    // 'message'-Listener oben aber fuer agent_message-broadcasts. WICHTIG:
+    // eigene Beitraege filtern (sonst Feedback-Schleife).
+    const agentMsgListenerRef: number = channel.on('agent_message', (payload: unknown) => {
+      const p = payload as Record<string, unknown>;
+      const senderId = typeof p['session_id'] === 'string' ? p['session_id'] : '';
+      if (senderId === agentSessionId) return; // unser eigener Beitrag — ignorieren
+      const senderName =
+        typeof p['sender'] === 'string' && p['sender']
+          ? p['sender']
+          : senderId || 'Agent';
+      const text = typeof p['text'] === 'string' ? p['text'] : String(p['content'] ?? '');
+      if (!text.trim()) return;
+      if (Buffer.byteLength(text, 'utf8') > MAX_INBOUND_BYTES) return;
+      // Mit Sender-Praefix injizieren damit das LLM weiss von wem die Nachricht kommt.
+      const prefixed = `[${senderName}]: ${text}`;
+      void resolveSessionId().then((sid) => {
+        if (!sid) return;
+        promptAsync(sid, prefixed).catch((err: unknown) => {
+          debugLog(`[chatroom-voice] promptAsync (agent_message) failed: ${String(err)}\n`);
+        });
+      });
+    });
+
+    // 2026-05-29 (Bug-Fix Roleplay-Observer): In Roleplay-Raeumen werden
+    // KI-Char-Beitraege NICHT als 'agent_message' sondern als 'bubble_added'
+    // (Observer-Pfad) oder 'message:new' / 'message:stream_end' (Bridge-Pfad)
+    // an den Phoenix-Channel gepusht. Wir hoeren auf alle drei und reichen
+    // jeden fremden Beitrag ans opencode-LLM weiter — eigene werden ueber
+    // session_id-Vergleich gefiltert.
+    function dispatchInbound(senderId: string, senderName: string, text: string): void {
+      if (!text.trim()) return;
+      if (senderId && senderId === agentSessionId) return;
+      if (Buffer.byteLength(text, 'utf8') > MAX_INBOUND_BYTES) return;
+      const prefixed = senderName ? `[${senderName}]: ${text}` : text;
+      void resolveSessionId().then((sid) => {
+        if (!sid) return;
+        promptAsync(sid, prefixed).catch((err: unknown) => {
+          debugLog(`[chatroom-voice] promptAsync (roleplay) failed: ${String(err)}\n`);
+        });
+      });
+    }
+
+    const bubbleAddedRef: number = channel.on('bubble_added', (payload: unknown) => {
+      const p = payload as Record<string, unknown>;
+      const sid =
+        typeof p['session_id'] === 'string'
+          ? p['session_id']
+          : typeof p['agent_id'] === 'string'
+            ? p['agent_id']
+            : '';
+      const name =
+        (typeof p['char_name'] === 'string' && p['char_name']) ||
+        (typeof p['sender'] === 'string' && p['sender']) ||
+        sid ||
+        'Char';
+      const text =
+        typeof p['content'] === 'string'
+          ? p['content']
+          : typeof p['text'] === 'string'
+            ? p['text']
+            : '';
+      dispatchInbound(sid, name, text);
+    });
+
+    const messageNewRef: number = channel.on('message:new', (payload: unknown) => {
+      const p = payload as Record<string, unknown>;
+      const sid = typeof p['session_id'] === 'string' ? p['session_id'] : '';
+      const name =
+        (typeof p['char_name'] === 'string' && p['char_name']) ||
+        (typeof p['sender'] === 'string' && p['sender']) ||
+        'Char';
+      const text = typeof p['text'] === 'string' ? p['text'] : '';
+      dispatchInbound(sid, name, text);
+    });
+
+    const messageStreamEndRef: number = channel.on('message:stream_end', (payload: unknown) => {
+      const p = payload as Record<string, unknown>;
+      const sid = typeof p['session_id'] === 'string' ? p['session_id'] : '';
+      const name =
+        (typeof p['char_name'] === 'string' && p['char_name']) ||
+        (typeof p['sender'] === 'string' && p['sender']) ||
+        'Char';
+      const text = typeof p['full_text'] === 'string' ? p['full_text'] : '';
+      dispatchInbound(sid, name, text);
     });
 
     // Event-driven room reassignment: backend AgentMover.move/3 broadcasts
@@ -505,6 +666,10 @@ async function openPhoenixChannel(
 
     return () => {
       channel.off('message', messageListenerRef);
+      channel.off('agent_message', agentMsgListenerRef);
+      channel.off('bubble_added', bubbleAddedRef);
+      channel.off('message:new', messageNewRef);
+      channel.off('message:stream_end', messageStreamEndRef);
       channel.off('agent_moved', movedListenerRef);
       channel.leave();
     };
@@ -512,16 +677,14 @@ async function openPhoenixChannel(
 
   leaveCurrent = subscribe(currentRoom);
 
-  // Slow liveness heartbeat: keeps backend's session_presence fresh and
-  // updates `model` metadata. Room changes are event-driven via agent_moved,
-  // so the heartbeat does NOT need to drive room sync.
+  // Liveness heartbeat: keeps backend's session_presence fresh and updates
+  // `model` metadata. Backend has a ~60s presence timeout; we ping every 30s
+  // to give one safety margin if a single heartbeat is in flight. We do NOT
+  // `.unref()` the timer because opencode's plugin sandbox observably stops
+  // firing unref'd timers, which caused false-offline cycles (see Task 5j).
   const heartbeatTimer = setInterval(() => {
     void resolveRoomViaHeartbeat(cfg, agentSessionId, getActiveModel());
   }, HEARTBEAT_INTERVAL_MS);
-  // Don't keep the event loop alive for the timer alone.
-  if (typeof (heartbeatTimer as { unref?: () => void }).unref === 'function') {
-    (heartbeatTimer as { unref?: () => void }).unref!();
-  }
 
   return () => {
     clearInterval(heartbeatTimer);
@@ -541,6 +704,67 @@ export const ChatroomVoice: Plugin = async (ctx): Promise<Hooks> => {
   // The ctx does not expose a session ID directly — we capture it from
   // tool.execute.before / event hooks on first use.
   let activeSessionId: string | undefined = cfg.sessionId;
+  /**
+   * Monotonic accumulator of full text per bubble (text + thought separately).
+   * Keyed by opencode assistant-message id (= bubble id) so parallel
+   * subagent-streams stay separated. Cleared on each `chat.message` (new turn).
+   */
+  const bubbleAcc = new Map<string, { text: string; thought: string }>();
+  /**
+   * partID → part.type cache learned from `message.part.updated` snapshots
+   * (which carry the full part-shape) so we can correctly classify later
+   * `message.part.delta` events (which carry only field+delta) as text vs
+   * reasoning even when the model uses a non-standard field name.
+   */
+  const partTypeCache = new Map<string, string>();
+  /**
+   * Per-partID deferred queue for deltas that arrived BEFORE the first
+   * .updated snapshot revealed part.type. Prevents misclassifying early
+   * reasoning-tokens as text when delta-events race ahead of snapshots.
+   * Auto-flushes as 'text' after PENDING_FLUSH_MS if no snapshot arrives.
+   */
+  type PendingDelta = { sessionId: string; messageId: string; partId: string; delta: string };
+  const pendingPartDeltas = new Map<
+    string,
+    { queue: PendingDelta[]; flushTimer: ReturnType<typeof setTimeout> }
+  >();
+  const PENDING_FLUSH_MS = 250;
+  function sendStreamDelta(p: PendingDelta, kind: 'text' | 'thought'): void {
+    const bubbleId = p.messageId;
+    const acc = bubbleAccGet(bubbleId);
+    if (kind === 'thought') acc.thought += p.delta;
+    else acc.text += p.delta;
+    if (process.env['OPENCODE_VOICE_DEBUG']) {
+      debugLog(`  POST agent-stream-delta bubble=${bubbleId} (msg=${p.messageId}) kind=${kind} delta="${p.delta.slice(0, 30)}"`);
+    }
+    postJsonFireAndForget(cfg.bearer, `${cfg.httpUrl}/api/agent-stream-delta`, {
+      message_id: bubbleId,
+      sender: cfg.agentName,
+      session_id: agentSessionId,
+      kind,
+      delta: p.delta,
+      // Bugfix 2026-05-28: include current model inline so the backend does
+      // not have to rely on the heartbeat-set SessionServer.get_model
+      // lookup (which has race-conditions: first deltas can arrive BEFORE
+      // the eager-heartbeat round-trip after a chat.message hook fires).
+      ...(activeModel ? { model: activeModel } : {}),
+    });
+  }
+  function flushPendingPart(partId: string, kind: 'text' | 'thought'): void {
+    const pending = pendingPartDeltas.get(partId);
+    if (!pending) return;
+    clearTimeout(pending.flushTimer);
+    for (const item of pending.queue) sendStreamDelta(item, kind);
+    pendingPartDeltas.delete(partId);
+  }
+  function bubbleAccGet(id: string): { text: string; thought: string } {
+    let acc = bubbleAcc.get(id);
+    if (!acc) {
+      acc = { text: '', thought: '' };
+      bubbleAcc.set(id, acc);
+    }
+    return acc;
+  }
 
   // Track the currently active LLM model so we can report it to the backend
   // via /api/heartbeat. opencode emits the model on every chat.message call;
@@ -568,6 +792,58 @@ export const ChatroomVoice: Plugin = async (ctx): Promise<Hooks> => {
   const resolvedRoom =
     (await resolveRoomViaHeartbeat(cfg, agentSessionId, activeModel)) ?? cfg.defaultRoom;
   let cleanupChannel: (() => void) | undefined;
+
+  /**
+   * Seed activeSessionId from the opencode session-status API at plugin init.
+   *
+   * Strategy: call GET /session/status which returns { [sessionID]: SessionStatus }.
+   * The TUI always has exactly the session it displays registered there. We pick
+   * the first (and usually only) session ID returned — it is the TUI's session.
+   * If multiple sessions are present we prefer a "busy" or "idle" one over any
+   * others (both indicate the TUI is actively using that session).
+   *
+   * This is the authoritative seed mechanism. The old session.list()-newest
+   * fallback was REMOVED because list() returns ALL sessions (including archived
+   * ones from previous opencode runs) sorted by creation time, NOT by which
+   * session the TUI is currently displaying. Picking "newest" from list() would
+   * target the wrong session when the user had multiple sessions.
+   *
+   * The session.status API, by contrast, only returns sessions the TUI has
+   * currently open/active — exactly the right set.
+   */
+  const seedSessionFromStatusApi = async (): Promise<void> => {
+    if (activeSessionId) return; // already seeded (e.g. by env override)
+    try {
+      const res = await ctx.client.session.status();
+      // response shape: { data?: { [sessionID]: SessionStatus } }
+      const map = (res as { data?: Record<string, { type?: string }> }).data;
+      if (map && typeof map === 'object') {
+        const entries = Object.entries(map);
+        if (entries.length === 0) return;
+        // Prefer a "busy" session (TUI is actively processing a turn) or
+        // "idle" (TUI is waiting for user input). Either means the TUI is
+        // showing that session. If only one session, just use it regardless.
+        const preferred =
+          entries.find(([, s]) => s?.type === 'busy') ??
+          entries.find(([, s]) => s?.type === 'idle') ??
+          entries[0];
+        if (preferred) {
+          activeSessionId = preferred[0];
+          debugLog(`[chatroom-voice] session seeded from status API → ${activeSessionId}\n`);
+        }
+      }
+    } catch (err) {
+      // Non-fatal: if the API call fails we will still seed from the first
+      // event hook that carries a sessionID (session.status, chat.message,
+      // tool.execute.before, message.updated).
+      debugLog(`[chatroom-voice] session.status seed failed: ${String(err)}\n`);
+    }
+  };
+
+  // Fire immediately — we want activeSessionId populated before the first
+  // inbound chatroom message can arrive via the Phoenix channel.
+  await seedSessionFromStatusApi();
+
   try {
     cleanupChannel = await openPhoenixChannel(
       cfg,
@@ -576,6 +852,13 @@ export const ChatroomVoice: Plugin = async (ctx): Promise<Hooks> => {
       () => activeSessionId,
       getActiveModel,
       promptAsync,
+      // No resolveSessionId fallback argument: pass the simple getter so
+      // openPhoenixChannel's internal default `async () => getSessionId()` is
+      // used. This means: use activeSessionId as-is, do NOT fall back to
+      // session.list(). If activeSessionId is still undefined here, the message
+      // will be dropped with a clear log line — which is the correct behavior
+      // (it means opencode has no active session at all, not that we targeted
+      // the wrong one).
     );
   } catch (err) {
     debugLog(
@@ -636,6 +919,11 @@ export const ChatroomVoice: Plugin = async (ctx): Promise<Hooks> => {
         activeSessionId = sid;
       }
 
+      // Bugfix 2026-05-28b: clear per-bubble cumulative text on each new turn.
+      // Per-bubble bubbles (one per assistant-message id) avoid the parallel
+      // subagent-stream interleaving issue from 2026-05-28a.
+      bubbleAcc.clear();
+
       // Derive canonical model string from input.model (providerID + modelID).
       const rawModel = (input as unknown as Record<string, unknown>)['model'] as
         | { providerID?: string; modelID?: string }
@@ -659,20 +947,55 @@ export const ChatroomVoice: Plugin = async (ctx): Promise<Hooks> => {
     // Event hook
     // -------------------------------------------------------------------------
     event: async ({ event }) => {
-      // DEBUG: log every event type to ~/.opencode-chatroom-voice.log so we
-      // can inspect what opencode actually emits.
+      // DEBUG 2026-05-28: log every event type AND property keys/sample-values
+      // so we can map what opencode actually emits (reasoning vs text vs task
+      // vs tool vs subagent) to our content-type taxonomy.
       if (process.env['OPENCODE_VOICE_DEBUG']) {
-        debugLog(`event type=${event.type}`);
+        try {
+          const props = ev_props(event);
+          const keys = Object.keys(props);
+          const sample: Record<string, string> = {};
+          for (const k of keys) {
+            const v = (props as Record<string, unknown>)[k];
+            if (typeof v === 'string') sample[k] = v.length > 80 ? v.slice(0, 80) + '…' : v;
+            else if (typeof v === 'number' || typeof v === 'boolean') sample[k] = String(v);
+            else if (v && typeof v === 'object') sample[k] = `{${Object.keys(v as object).slice(0, 6).join(',')}}`;
+            else sample[k] = typeof v;
+          }
+          debugLog(`event type=${event.type} keys=${keys.join(',')} sample=${JSON.stringify(sample)}`);
+        } catch {
+          debugLog(`event type=${event.type}`);
+        }
       }
       // -- Inbound session tracking --
-      // Capture the session ID from session-status events so inbound messages
-      // can be routed even if no env-override was provided.
+      // Capture the session ID from session-lifecycle events so inbound messages
+      // can be routed even if the status-API seed (above) raced with the first
+      // event. Priority: env override → status-API seed → first lifecycle event.
+      //
+      // session.created fires when opencode creates a new session (including at
+      // TUI startup). This is the earliest possible signal for a fresh session.
+      if (event.type === 'session.created') {
+        const props = ev_props(event);
+        const info = props['info'];
+        if (info && typeof info === 'object') {
+          const sid = (info as Record<string, unknown>)['id'];
+          if (typeof sid === 'string' && sid && !activeSessionId) {
+            activeSessionId = sid;
+            debugLog(`[chatroom-voice] session seeded from session.created → ${sid}\n`);
+          }
+        }
+        return;
+      }
+
+      // session.status fires when a session transitions to idle/busy/retry.
+      // Use it to seed activeSessionId in case we missed session.created.
       if (event.type === 'session.status') {
         const status = event.properties;
         if (typeof status === 'object' && status !== null) {
           const sid = (status as Record<string, unknown>)['sessionID'];
           if (typeof sid === 'string' && sid && !activeSessionId) {
             activeSessionId = sid;
+            debugLog(`[chatroom-voice] session seeded from session.status → ${sid}\n`);
           }
         }
         return;
@@ -694,105 +1017,97 @@ export const ChatroomVoice: Plugin = async (ctx): Promise<Hooks> => {
         const delta = typeof props['delta'] === 'string' ? props['delta'] : '';
         if (!delta) return;
         const field = typeof props['field'] === 'string' ? props['field'] : 'text';
+        // DEBUG 2026-05-28: log raw field+keys so we can confirm whether
+        // reasoning arrives as a distinct field or only inline in text deltas.
+        if (process.env['OPENCODE_VOICE_DEBUG']) {
+          debugLog(`  raw delta keys=${Object.keys(props).join(',')} field=${field}`);
+        }
         if (field !== 'text' && field !== 'reasoning') return;
         const sessionId = typeof props['sessionID'] === 'string' ? props['sessionID'] : '';
         const messageId = typeof props['messageID'] === 'string' ? props['messageID'] : '';
         const partId = typeof props['partID'] === 'string' ? props['partID'] : '';
         if (!sessionId || !messageId || !partId) return;
-        const kind: 'text' | 'thought' = field === 'reasoning' ? 'thought' : 'text';
-
+        // Classify as thought if EITHER the field name says reasoning OR the
+        // cached part.type from an earlier .updated snapshot says reasoning.
+        // This catches models whose delta-stream emits field="text" but the
+        // snapshot carries part.type="reasoning".
         if (sessionId && !activeSessionId) activeSessionId = sessionId;
         evictStaleParts(partBuffer);
         if (partBuffer.size >= PART_BUFFER_MAX) {
           debugLog(`partBuffer cap (${PART_BUFFER_MAX}) — clearing`);
           partBuffer.clear();
         }
-        const existing = partBuffer.get(partId);
-        if (existing) {
-          existing.chunks.push(delta);
-          existing.lastUpdatedAt = Date.now();
-        } else {
-          partBuffer.set(partId, { kind, chunks: [delta], messageId, lastUpdatedAt: Date.now() });
+
+        // Race-condition fix 2026-05-28: classification depends on part.type
+        // from the .updated snapshot, but the first few .delta events may
+        // arrive BEFORE the first snapshot. If we have no cache entry yet,
+        // queue the delta and wait briefly for the snapshot — otherwise
+        // early reasoning-tokens get misclassified as text and pollute the
+        // text-body / TTS pipeline.
+        const item: PendingDelta = { sessionId, messageId, partId, delta };
+        const cachedType = partTypeCache.get(partId);
+        if (cachedType !== undefined) {
+          const isReasoning = field === 'reasoning' || cachedType === 'reasoning';
+          sendStreamDelta(item, isReasoning ? 'thought' : 'text');
+          return;
         }
-        if (process.env['OPENCODE_VOICE_DEBUG']) {
-          debugLog(`  POST agent-stream-delta msg=${messageId} kind=${kind} delta="${delta.slice(0, 30)}"`);
+        if (field === 'reasoning') {
+          sendStreamDelta(item, 'thought');
+          return;
         }
-        postJsonFireAndForget(cfg.bearer, `${cfg.httpUrl}/api/agent-stream-delta`, {
-          message_id: messageId,
-          sender: cfg.agentName,
-          session_id: sessionId,
-          kind,
-          delta,
-        });
+        let pending = pendingPartDeltas.get(partId);
+        if (!pending) {
+          const flushTimer = setTimeout(() => flushPendingPart(partId, 'text'), PENDING_FLUSH_MS);
+          pending = { queue: [], flushTimer };
+          pendingPartDeltas.set(partId, pending);
+        }
+        pending.queue.push(item);
         return;
       }
 
-      // -- message.part.updated — full part-shape snapshot, no delta inside --
-      // We skip these here: the token stream goes through .delta above, and
-      // message.updated (assistant complete) flushes the buffer below.
+      // -- message.part.updated — snapshot, IGNORED for delta-broadcast --
+      // Bugfix 2026-05-28: previously this handler also POSTed agent-stream-delta
+      // which caused token DUPLICATION (UI rendered every delta twice, visible as
+      // garbled "** Docsund**", "1.Ke ** ofin" etc.). The `.delta` handler above
+      // is authoritative for token streaming; `.updated` snapshots are only
+      // informational and require no separate broadcast.
       if (event.type === 'message.part.updated') {
-        const ev = event as EventMessagePartUpdated;
-        const delta = ev.properties.delta;
-
-        // `message.part.delta` events frequently arrive without a populated
-        // `part` object — only the delta string is present until a later
-        // `.updated` snapshot fills the shape. Skip until we have a part.
-        const part = ev.properties.part;
-        if (!part || typeof part !== 'object') return;
-        if (part.type !== 'text' && part.type !== 'reasoning') return;
-        if (!delta) return; // .updated snapshots without delta — ignore
-
-        const kind: 'text' | 'thought' = part.type === 'reasoning' ? 'thought' : 'text';
-        const sessionId = part.sessionID;
-        const messageId = part.messageID;
-        if (!sessionId || !messageId) return;
-
-        // Track the active session from stream events as well.
-        if (sessionId && !activeSessionId) activeSessionId = sessionId;
-
-        // Lazy TTL eviction before any buffer mutation.
-        evictStaleParts(partBuffer);
-
-        // Size-cap guard: warn and clear when buffer grows too large.
-        if (partBuffer.size >= PART_BUFFER_MAX) {
-          debugLog(
-            `[chatroom-voice] WARN: partBuffer size cap (${PART_BUFFER_MAX}) reached — clearing stale entries\n`,
-          );
-          partBuffer.clear();
-        }
-
-        // Accumulate in string[] chunks (avoids O(n^2) string concat).
-        const existing = partBuffer.get(part.id);
-        if (existing) {
-          existing.chunks.push(delta);
-          existing.lastUpdatedAt = Date.now();
-        } else {
-          partBuffer.set(part.id, {
-            kind,
-            chunks: [delta],
-            messageId,
-            lastUpdatedAt: Date.now(),
-          });
-        }
-
-        // Fire-and-forget: do NOT await — keeps delta path non-blocking.
-        postJsonFireAndForget(cfg.bearer, `${cfg.httpUrl}/api/agent-stream-delta`, {
-          room_id: cfg.defaultRoom,
-          message_id: messageId,
-          sender: cfg.agentName,
-          session_id: sessionId,
-          kind,
-          delta,
-        });
+        // Learn part.type → cache for later .delta classification.
+        try {
+          const props = ev_props(event);
+          const part = (props as Record<string, unknown>)['part'];
+          if (part && typeof part === 'object') {
+            const p = part as Record<string, unknown>;
+            const id = p['id'];
+            const type = p['type'];
+            if (typeof id === 'string' && typeof type === 'string') {
+              partTypeCache.set(id, type);
+              if (process.env['OPENCODE_VOICE_DEBUG']) {
+                const preview =
+                  typeof p['text'] === 'string'
+                    ? (p['text'] as string).slice(0, 60)
+                    : '';
+                debugLog(`    part.type=${type} partID=${id} preview="${preview}"`);
+              }
+              // Flush any deltas that arrived before this snapshot.
+              if (pendingPartDeltas.has(id)) {
+                flushPendingPart(id, type === 'reasoning' ? 'thought' : 'text');
+              }
+            }
+          }
+        } catch {}
+        // No re-broadcast — `.delta` is the authoritative streaming path.
         return;
       }
 
       // -- Message completed --
+      // Per-bubble (=per-assistant-message) complete: flush the cumulative
+      // text from bubbleAcc[assistant.id]. Each subagent and each sequential
+      // assistant-message gets its own complete-event with its own bubble id.
       if (event.type === 'message.updated') {
         const ev = event as EventMessageUpdated;
         const msg = ev.properties.info;
 
-        // Only react to completed assistant messages.
         if (msg.role !== 'assistant') return;
         const assistant = msg as AssistantMessage;
         if (!assistant.time.completed) return;
@@ -800,28 +1115,57 @@ export const ChatroomVoice: Plugin = async (ctx): Promise<Hooks> => {
         const sessionId = assistant.sessionID;
         if (sessionId && !activeSessionId) activeSessionId = sessionId;
 
-        // Flush all buffered parts for THIS message only (messageId-gated).
-        // Parts belonging to other messages (e.g. concurrent streams) are kept.
-        const flushPromises: Promise<void>[] = [];
-        for (const [partId, buf] of partBuffer) {
-          if (buf.messageId !== assistant.id) continue;
+        // Flush any pending deltas (race-condition fix) for this message
+        // BEFORE we read bubbleAcc — otherwise the final completes will miss
+        // the last 250ms worth of tokens that were still queued under
+        // pendingPartDeltas waiting for a part-type snapshot. Default-flush
+        // them with the cached type or fall back to text.
+        for (const [partId, _pending] of pendingPartDeltas) {
+          const t = partTypeCache.get(partId);
+          flushPendingPart(partId, t === 'reasoning' ? 'thought' : 'text');
+        }
 
-          flushPromises.push(
+        // Clean up partBuffer entries for this assistant-message (no broadcast
+        // needed — bubbleAcc holds the authoritative cumulative text).
+        for (const [partId, buf] of partBuffer) {
+          if (buf.messageId === assistant.id) partBuffer.delete(partId);
+        }
+
+        const acc = bubbleAcc.get(assistant.id);
+        if (!acc) return;
+
+        const completes: Promise<void>[] = [];
+        if (acc.text.length > 0) {
+          completes.push(
             postJson(cfg.bearer, `${cfg.httpUrl}/api/agent-stream-complete`, {
               room_id: cfg.defaultRoom,
               message_id: assistant.id,
               sender: cfg.agentName,
-              session_id: sessionId,
-              kind: buf.kind,
-              full_text: buf.chunks.join(''),
-              trigger_tts: buf.kind === 'text',
+              // Bugfix 2026-05-28: chatroom identity (not opencode-internal)
+              session_id: agentSessionId,
+              ...(activeModel ? { model: activeModel } : {}),
+              kind: 'text',
+              full_text: acc.text,
+              trigger_tts: true,
             }),
           );
-          partBuffer.delete(partId);
         }
-
-        // Flush all matching parts in parallel (independent HTTP calls).
-        await Promise.all(flushPromises);
+        if (acc.thought.length > 0) {
+          completes.push(
+            postJson(cfg.bearer, `${cfg.httpUrl}/api/agent-stream-complete`, {
+              room_id: cfg.defaultRoom,
+              message_id: assistant.id,
+              sender: cfg.agentName,
+              // Bugfix 2026-05-28: chatroom identity (not opencode-internal)
+              session_id: agentSessionId,
+              ...(activeModel ? { model: activeModel } : {}),
+              kind: 'thought',
+              full_text: acc.thought,
+              trigger_tts: false,
+            }),
+          );
+        }
+        await Promise.all(completes);
         return;
       }
     },
@@ -832,6 +1176,27 @@ export const ChatroomVoice: Plugin = async (ctx): Promise<Hooks> => {
     // tools. Append so opencode's built-in mode prompt stays intact.
     // -------------------------------------------------------------------------
     'experimental.chat.system.transform': async (_input, output) => {
+      // 2026-05-30: Wenn aktiv Observer-Modus in einem Roleplay-Raum, ERSETZEN
+      // wir den eingebauten opencode-Software-Engineer-Prompt komplett durch
+      // den User-definierten Char-Prompt (User-Vorgabe — opencode soll im
+      // Roleplay-Raum kein Software-Engineer mehr sein). Voice-Mode-Block
+      // bleibt erhalten weil TTS-Hinweise immer noch gelten.
+      if (observerStateCache && observerStateCache.systemPrompt) {
+        const charName = observerStateCache.displayCharName || 'Beobachter';
+        output.system.length = 0;
+        output.system.push(
+          `# Beobachter-Modus: ${charName}\n` +
+            `Du beobachtest einen Roleplay-Raum (room=${observerStateCache.roomId}). ` +
+            `Beitraege der Roleplay-Charaktere werden dir mit Praefix [Name]: ... zugestellt. ` +
+            `Deine Antworten gehen NIEMALS zurueck an die Roleplay-Charaktere — nur der Browser-User hoert sie via TTS. ` +
+            `Du bist KEIN Software-Engineering-Assistent waehrend dieser Sitzung — du bist die Rolle die der Browser-User unten beschreibt. ` +
+            `Folgende Charakter-/Verhaltensanweisung wurde dir vom Browser-User mitgegeben:\n\n${observerStateCache.systemPrompt}`,
+        );
+        output.system.push(VOICE_MODE_SYSTEM_PROMPT);
+        return;
+      }
+      // Normaler Modus (kein Observer): nur unseren Voice-Block ANHAENGEN,
+      // opencodes eingebauten Software-Engineer-Default-Prompt unangetastet.
       output.system.push(VOICE_MODE_SYSTEM_PROMPT);
     },
 
