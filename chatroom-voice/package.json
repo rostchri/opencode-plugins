@@ -17,7 +17,10 @@
       "types": "./dist/index.d.ts"
     }
   },
-  "files": ["dist", "README.md"],
+  "files": [
+    "dist",
+    "README.md"
+  ],
   "scripts": {
     "build": "bun build src/index.ts --outdir dist --target bun --format esm",
     "build:tsc": "tsc --outDir dist --declaration --declarationMap",
@@ -25,7 +28,8 @@
     "test": "node --test test/index.test.mjs"
   },
   "dependencies": {
-    "phoenix": "1.8.7"
+    "phoenix": "^1.8.7",
+    "ws": "^8.18.0"
   },
   "peerDependencies": {
     "@opencode-ai/plugin": "*"

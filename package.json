@@ -2,15 +2,14 @@
   "name": "opencode-plugins",
   "version": "0.0.0",
   "private": true,
-  "description": "Mono-repo of OpenCode plugins (chatroom-voice, memcore)",
+  "description": "Mono-repo of OpenCode plugins (chatroom-voice)",
   "license": "MIT",
   "repository": {
     "type": "git",
     "url": "https://github.com/rostchri/opencode-plugins.git"
   },
   "workspaces": [
-    "chatroom-voice",
-    "memcore"
+    "chatroom-voice"
   ],
   "scripts": {
     "build": "bun run --filter '*' build",
@@ -19,6 +18,7 @@
   },
   "devDependencies": {
     "@types/bun": "latest",
+    "@types/ws": "^8.18.1",
     "prettier": "^3.3.0",
     "typescript": "^5.6.0"
   }

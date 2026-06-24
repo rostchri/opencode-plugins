@@ -10,7 +10,6 @@ Each subdirectory is an independent plugin that can be installed standalone via
 | Plugin | Purpose | Status |
 |--------|---------|--------|
 | [`chatroom-voice`](./chatroom-voice/) | Event-driven voice integration (browser TTS+STT, multi-room) via a Phoenix-channel backend | planned |
-| [`memcore`](./memcore/) | Long-term agent memory via a self-hosted memcore MCP server (analogous to `opencode-supermemory` but pointed at memcore + the AMP tool family) | planned |
 
 ## Design constraints
 
@@ -18,7 +17,6 @@ Each subdirectory is an independent plugin that can be installed standalone via
   bearer token, room identifier or hostname comes from environment variables
   (documented per plugin). The repo is safe to publish.
 - **Generic.** Each plugin targets a class of backend (any Phoenix-channel
-  voice backend, any memcore-compatible MCP server), not a specific hostname.
 - **TypeScript, [Bun](https://bun.sh)-runtime.** Same as upstream OpenCode.
 - **Hooks-only.** No fork of OpenCode itself — everything happens through the
   documented [plugin API](https://opencode.ai/docs/plugins/).
@@ -31,7 +29,6 @@ Each subdirectory is an independent plugin that can be installed standalone via
 │   ├── package.json
 │   ├── src/index.ts
 │   └── README.md
-├── memcore/
 │   └── ...
 ├── package.json         workspace root
 └── tsconfig.json        shared tsconfig
