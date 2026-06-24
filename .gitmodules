@@ -1,0 +1,4 @@
+[submodule "opencode-graphiti"]
+	path = opencode-graphiti
+	url = https://github.com/rostchri/opencode-graphiti.git
+	branch = bearer-auth
